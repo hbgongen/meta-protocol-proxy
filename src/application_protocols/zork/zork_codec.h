@@ -23,6 +23,10 @@ enum class ZorkDecodeStatus {
   DecodePayload,
   DecodeDone,
   WaitForData,
+  DecodeResponseHeader,
+  DecodeResponsePayload,
+  DecodeResponseDone,
+  ResponseWaitForData
 };
 
 
@@ -58,12 +62,15 @@ protected:
 
 private:
   ZorkDecodeStatus decode_status_request{ZorkDecodeStatus::DecodeHeader};
-  ZorkDecodeStatus decode_status_response{ZorkDecodeStatus::DecodeHeader};
+  ZorkDecodeStatus decode_status_response{ZorkDecodeStatus::DecodeResponseHeader};
   ZorkHeader zork_header_request_;
   ZorkHeader zork_header_response_;
+  int64_t coming_buffer_len;
   MetaProtocolProxy::MessageType messageType_;
-  std::unique_ptr<Buffer::OwnedImpl> origin_msg_request_;
-  std::unique_ptr<Buffer::OwnedImpl> origin_msg_response_;
+  // std::unique_ptr<Buffer::OwnedImpl> origin_msg_request_;
+  // std::unique_ptr<Buffer::OwnedImpl> origin_msg_response_;
+  Buffer::OwnedImpl origin_msg_request_;
+  Buffer::OwnedImpl origin_msg_response_;
 };
 
 } // namespace Zork

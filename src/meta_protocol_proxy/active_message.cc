@@ -14,11 +14,12 @@ namespace MetaProtocolProxy {
 // class ActiveResponseDecoder
 ActiveResponseDecoder::ActiveResponseDecoder(ActiveMessage& parent, MetaProtocolProxyStats& stats,
                                              Network::Connection& connection,
-                                             std::string applicationProtocol, Codec& codec,
+                                             std::string applicationProtocol, CodecPtr&& codec,
                                              Metadata& requestMetadata)
     : parent_(parent), stats_(stats), downstream_connection_(connection),
-      application_protocol_(applicationProtocol), codec_(codec), request_metadata_(requestMetadata),
-      decoder_(std::make_unique<ResponseDecoder>(codec_, *this)), complete_(false),
+      application_protocol_(applicationProtocol), codec_(std::move(codec)),
+      request_metadata_(requestMetadata),
+      decoder_(std::make_unique<ResponseDecoder>(*codec_, *this)), complete_(false),
       response_status_(UpstreamResponseStatus::MoreData) {}
 
 UpstreamResponseStatus ActiveResponseDecoder::onData(Buffer::Instance& data) {
@@ -39,12 +40,47 @@ UpstreamResponseStatus ActiveResponseDecoder::onData(Buffer::Instance& data) {
   return response_status_;
 }
 
+#define MARKET_VS_FLAG "1"
+#define MARKET_VS_FLAG_COMPRESS "3"
+#define MARKET_VZ_FLAG "4"
+#define MARKET_VZ_FLAG_COMPRESS "6"
+#define MARKET_US_FLAG "5"
+#define MARKET_US_FLAG_COMPRESS "7"
+#define MARKET_UK_FLAG "8"
+#define MARKET_UK_FLAG_COMPRESS "10"
+#define MARKET_VK_FLAG "9"
+#define MARKET_VK_FLAG_COMPRESS "11"
+#define MARKET_DEFAULT_FLAG "99"
+
+
+void ActiveMessage::IncMarketStats(MetadataSharedPtr metadata){
+    std::string market_flag = metadata->getString("market");
+
+    if ( MARKET_VS_FLAG == market_flag || MARKET_VS_FLAG_COMPRESS == market_flag){
+      connection_manager_.stats().route_vs_.inc();
+    }else if( MARKET_VZ_FLAG == market_flag || MARKET_VZ_FLAG_COMPRESS == market_flag){
+      connection_manager_.stats().route_vz_.inc();
+    }else if( MARKET_US_FLAG == market_flag || MARKET_US_FLAG_COMPRESS == market_flag){
+      connection_manager_.stats().route_us_.inc();
+    }else if( MARKET_UK_FLAG == market_flag || MARKET_UK_FLAG_COMPRESS == market_flag){
+      connection_manager_.stats().route_uk_.inc();
+    }else if( MARKET_VK_FLAG == market_flag || MARKET_VK_FLAG_COMPRESS == market_flag){
+      connection_manager_.stats().route_uk_.inc();
+    }else{
+      connection_manager_.stats().route_default_.inc();
+    }   
+}
+
 void ActiveResponseDecoder::onMessageDecoded(MetadataSharedPtr metadata,
                                              MutationSharedPtr mutation) {
   ASSERT(metadata->getMessageType() == MessageType::Response ||
          metadata->getMessageType() == MessageType::Error);
+  parent_.stream_info_->addBytesReceived(metadata->getMessageSize());
+  parent_.stream_info_->onRequestComplete();
 
   metadata_ = metadata;
+  MetadataImpl* metadataImpl = static_cast<MetadataImpl*>(&(*metadata));
+  metadataImpl->setStreamInfo(parent_.stream_info_);
   if (applyMessageEncodedFilters(metadata, mutation) != FilterStatus::ContinueIteration) {
     response_status_ = UpstreamResponseStatus::Complete;
     return;
@@ -55,12 +91,10 @@ void ActiveResponseDecoder::onMessageDecoded(MetadataSharedPtr metadata,
   }
 
   // put real server ip in the response
-  metadata_->putString(Metadata::HEADER_REAL_SERVER_ADDRESS,
-                       request_metadata_.getString(Metadata::HEADER_REAL_SERVER_ADDRESS));
-
-  // TODO support response mutation
-  codec_.encode(*metadata_, Mutation{}, metadata->getOriginMessage());
-  downstream_connection_.write(metadata->getOriginMessage(), false);
+  metadata_->putString(ReservedHeaders::RealServerAddress,
+                       request_metadata_.getString(ReservedHeaders::RealServerAddress));
+  codec_->encode(*metadata_, *mutation, metadata->originMessage());
+  downstream_connection_.write(metadata->originMessage(), false);
   ENVOY_LOG(debug,
             "meta protocol {} response: the upstream response message has been forwarded to the "
             "downstream",
@@ -79,7 +113,7 @@ void ActiveResponseDecoder::onMessageDecoded(MetadataSharedPtr metadata,
   default:
     stats_.response_error_.inc();
     ENVOY_LOG(error, "meta protocol {} response status: {}", application_protocol_,
-              metadata->getResponseStatus());
+              static_cast<int>(metadata->getResponseStatus()));
     break;
   }
 
@@ -145,7 +179,7 @@ void ActiveMessageDecoderFilter::continueDecoding() {
   ENVOY_LOG(debug, "meta protocol: continueDecoding, id is {}",
             activeMessage_.metadata()->getRequestId());
   auto state = ActiveMessage::FilterIterationStartState::AlwaysStartFromNext;
-  if (0 != activeMessage_.metadata()->getOriginMessage().length()) {
+  if (0 != activeMessage_.metadata()->originMessage().length()) {
     state = ActiveMessage::FilterIterationStartState::CanStartFromCurrent;
     ENVOY_LOG(warn, "The original message data is not consumed, triggering the decoder filter from "
                     "the current location");
@@ -177,11 +211,28 @@ void ActiveMessageDecoderFilter::resetDownstreamConnection() {
   activeMessage_.resetDownstreamConnection();
 }
 
-Codec& ActiveMessageDecoderFilter::codec() { return activeMessage_.codec(); }
+CodecPtr ActiveMessageDecoderFilter::createCodec() { return activeMessage_.createCodec(); }
 
 void ActiveMessageDecoderFilter::setUpstreamConnection(
     Tcp::ConnectionPool::ConnectionDataPtr conn) {
+	//stream_info_->setUpstreamInfo(std::move(conn));
   return activeMessage_.setUpstreamConnection(std::move(conn));
+}
+
+Tracing::MetaProtocolTracerSharedPtr ActiveMessageDecoderFilter::tracer() {
+  return activeMessage_.tracer();
+}
+
+Tracing::TracingConfig* ActiveMessageDecoderFilter::tracingConfig() {
+  return activeMessage_.tracingConfig();
+}
+
+RequestIDExtensionSharedPtr ActiveMessageDecoderFilter::requestIDExtension() {
+  return activeMessage_.requestIDExtension();
+}
+
+const std::vector<AccessLog::InstanceSharedPtr>& ActiveMessageDecoderFilter::accessLogs() {
+  return activeMessage_.accessLogs();
 }
 
 // class ActiveMessageEncoderFilter
@@ -193,7 +244,7 @@ ActiveMessageEncoderFilter::ActiveMessageEncoderFilter(ActiveMessage& parent,
 void ActiveMessageEncoderFilter::continueEncoding() {
   ASSERT(activeMessage_.metadata());
   auto state = ActiveMessage::FilterIterationStartState::AlwaysStartFromNext;
-  if (0 != activeMessage_.metadata()->getOriginMessage().length()) {
+  if (0 != activeMessage_.metadata()->originMessage().length()) {
     state = ActiveMessage::FilterIterationStartState::CanStartFromCurrent;
     ENVOY_LOG(warn, "The original message data is not consumed, triggering the encoder filter from "
                     "the current location");
@@ -211,11 +262,11 @@ ActiveMessage::ActiveMessage(ConnectionManager& connection_manager)
           connection_manager.stats().request_time_ms_, connection_manager.timeSystem())),
       stream_id_(
           connection_manager.randomGenerator().random()), // todo: we don't need stream id here?
-      stream_info_(connection_manager.timeSystem(),
-                   connection_manager.connection().connectionInfoProviderSharedPtr()),
+      stream_info_(std::make_unique<StreamInfo::StreamInfoImpl>(
+          connection_manager.timeSystem(),
+          connection_manager.connection().connectionInfoProviderSharedPtr())),
       pending_stream_decoded_(false), local_response_sent_(false) {
   connection_manager.stats().request_active_.inc();
-  
 }
 
 ActiveMessage::~ActiveMessage() {
@@ -269,42 +320,19 @@ ActiveMessage::commonDecodePrefix(ActiveMessageDecoderFilter* filter,
   return std::next(filter->entry());
 }
 
-#define MARKET_VS_FLAG "1"
-#define MARKET_VS_FLAG_COMPRESS "3"
-#define MARKET_VZ_FLAG "4"
-#define MARKET_VZ_FLAG_COMPRESS "6"
-#define MARKET_US_FLAG "5"
-#define MARKET_US_FLAG_COMPRESS "7"
-#define MARKET_UK_FLAG "8"
-#define MARKET_UK_FLAG_COMPRESS "10"
-#define MARKET_VK_FLAG "9"
-#define MARKET_VK_FLAG_COMPRESS "11"
-#define MARKET_DEFAULT_FLAG "99"
-
-void ActiveMessage::IncMarketStats(MetadataSharedPtr metadata){
-    std::string market_flag = metadata->getString("market");
-
-    if ( MARKET_VS_FLAG == market_flag || MARKET_VS_FLAG_COMPRESS == market_flag){
-      connection_manager_.stats().route_vs_.inc();
-    }else if( MARKET_VZ_FLAG == market_flag || MARKET_VZ_FLAG_COMPRESS == market_flag){
-      connection_manager_.stats().route_vz_.inc();
-    }else if( MARKET_US_FLAG == market_flag || MARKET_US_FLAG_COMPRESS == market_flag){
-      connection_manager_.stats().route_us_.inc();
-    }else if( MARKET_UK_FLAG == market_flag || MARKET_UK_FLAG_COMPRESS == market_flag){
-      connection_manager_.stats().route_uk_.inc();
-    }else if( MARKET_VK_FLAG == market_flag || MARKET_VK_FLAG_COMPRESS == market_flag){
-      connection_manager_.stats().route_uk_.inc();
-    }else{
-      connection_manager_.stats().route_default_.inc();
-    }   
-}
-
 void ActiveMessage::onMessageDecoded(MetadataSharedPtr metadata, MutationSharedPtr mutation) {
   connection_manager_.stats().request_decoding_success_.inc();
+  stream_info_->addBytesSent(metadata->getMessageSize());
+
+  // application protocol will be used to emit access log
+  // Todo This may not be the best place to set application protocol for metadata, we better set it
+  // at the decode machine
+  metadata->putString(ReservedHeaders::ApplicationProtocol,
+                      connection_manager_.config().applicationProtocol());
+
   bool needApplyFilters = false;
   switch (metadata->getMessageType()) {
   case MessageType::Request:
-    IncMarketStats(metadata);
     needApplyFilters = true;
     break;
   case MessageType::Stream_Init:
@@ -319,7 +347,7 @@ void ActiveMessage::onMessageDecoded(MetadataSharedPtr metadata, MutationSharedP
                 "stream id: {}",
                 metadata->getStreamId());
       Stream& existingStream = connection_manager_.getActiveStream(metadata->getStreamId());
-      existingStream.send2upstream(metadata->getOriginMessage());
+      existingStream.send2upstream(metadata->originMessage());
     } else {
       ENVOY_LOG(error,
                 "meta protocol request: can't find an existing stream for stream data message, "
@@ -334,7 +362,7 @@ void ActiveMessage::onMessageDecoded(MetadataSharedPtr metadata, MutationSharedP
       Stream& existingStream = connection_manager_.getActiveStream(metadata->getStreamId());
       // order matters, close stream before calling send2upstream
       existingStream.closeClientStream();
-      existingStream.send2upstream(metadata->getOriginMessage());
+      existingStream.send2upstream(metadata->originMessage());
     } else {
       ENVOY_LOG(error,
                 "meta protocol request: can't find an existing stream for stream close message, "
@@ -350,7 +378,7 @@ void ActiveMessage::onMessageDecoded(MetadataSharedPtr metadata, MutationSharedP
       // order matters, close stream before calling send2upstream
       existingStream.closeClientStream();
       existingStream.closeServerStream();
-      existingStream.send2upstream(metadata->getOriginMessage());
+      existingStream.send2upstream(metadata->originMessage());
     } else {
       ENVOY_LOG(error,
                 "meta protocol request: can't find an existing stream for stream close message, "
@@ -387,7 +415,7 @@ void ActiveMessage::onMessageDecoded(MetadataSharedPtr metadata, MutationSharedP
       maybeDeferredDeleteMessage();
       break;
     default:
-      NOT_REACHED_GCOVR_EXCL_LINE;
+      PANIC("invalid filter status");
     }
   } else {
     maybeDeferredDeleteMessage();
@@ -401,6 +429,22 @@ void ActiveMessage::onMessageDecoded(MetadataSharedPtr metadata, MutationSharedP
 
 void ActiveMessage::setUpstreamConnection(Tcp::ConnectionPool::ConnectionDataPtr conn) {
   connection_manager_.getActiveStream(metadata_->getStreamId()).setUpstreamConn(std::move(conn));
+}
+
+Tracing::MetaProtocolTracerSharedPtr ActiveMessage::tracer() {
+  return connection_manager_.tracer();
+}
+
+Tracing::TracingConfig* ActiveMessage::tracingConfig() {
+  return connection_manager_.tracingConfig();
+}
+
+RequestIDExtensionSharedPtr ActiveMessage::requestIDExtension() {
+  return connection_manager_.requestIDExtension();
+}
+
+const std::vector<AccessLog::InstanceSharedPtr>& ActiveMessage::accessLogs() {
+  return connection_manager_.accessLogs();
 }
 
 void ActiveMessage::maybeDeferredDeleteMessage() {
@@ -516,12 +560,12 @@ void ActiveMessage::startUpstreamResponse(Metadata& requestMetadata) {
 
   ASSERT(response_decoder_ == nullptr);
 
-  Codec& codec = connection_manager_.config().createCodec();
+  CodecPtr codec = connection_manager_.config().createCodec();
 
   // Create a response message decoder.
   response_decoder_ = std::make_unique<ActiveResponseDecoder>(
       *this, connection_manager_.stats(), connection_manager_.connection(),
-      connection_manager_.config().applicationProtocol(), codec, requestMetadata);
+      connection_manager_.config().applicationProtocol(), std::move(codec), requestMetadata);
 }
 
 UpstreamResponseStatus ActiveMessage::upstreamData(Buffer::Instance& buffer) {
@@ -566,7 +610,7 @@ void ActiveMessage::resetDownstreamConnection() {
   connection_manager_.connection().close(Network::ConnectionCloseType::NoFlush);
 }
 
-Codec& ActiveMessage::codec() { return connection_manager_.config().createCodec(); }
+CodecPtr ActiveMessage::createCodec() { return connection_manager_.config().createCodec(); }
 
 void ActiveMessage::resetStream() { connection_manager_.deferredDeleteMessage(*this); }
 
@@ -576,7 +620,7 @@ uint64_t ActiveMessage::requestId() const {
 
 uint64_t ActiveMessage::streamId() const { return stream_id_; }
 
-StreamInfo::StreamInfo& ActiveMessage::streamInfo() { return stream_info_; }
+StreamInfo::StreamInfo& ActiveMessage::streamInfo() { return *stream_info_; }
 
 Event::Dispatcher& ActiveMessage::dispatcher() {
   return connection_manager_.connection().dispatcher();

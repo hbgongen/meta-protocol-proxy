@@ -16,8 +16,7 @@ UpstreamRequest::UpstreamRequest(RequestOwner& parent, Upstream::TcpPoolData& po
     : parent_(parent), conn_pool_(pool), metadata_(metadata), mutation_(mutation),
       request_complete_(false), response_started_(false), response_complete_(false),
       stream_reset_(false) {
-  upstream_request_buffer_.move(metadata->getOriginMessage(),
-                                metadata->getOriginMessage().length());
+  upstream_request_buffer_.move(metadata->originMessage(), metadata->originMessage().length());
 }
 
 FilterStatus UpstreamRequest::start() {
@@ -47,7 +46,7 @@ void UpstreamRequest::onUpstreamConnectionEvent(Network::ConnectionEvent event) 
     break;
   default:
     // Connected event is consumed by the connection pool.
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not reached");
   }
 }
 
@@ -63,19 +62,20 @@ void UpstreamRequest::releaseUpStreamConnection(bool close) {
   }
 
   // we already got an upstream connection from the pool
-  if (conn_data_) {
-    ASSERT(!conn_pool_handle_);
-
+  // The event triggered by close will also release this connection so clear conn_data_ before
+  // closing.
+  // upstream connection is released back to the pool for re-use when it's containing
+  // ConnectionData is destroyed
+  // important: two threads(dispatcher thread and the upstream conn thread) are operating on the
+  // class variable conn_data_?
+  // Move conn_data_ to local variable because it may be released by the upstream response, which
+  // will cause segment fault
+  Tcp::ConnectionPool::ConnectionDataPtr conn_data = std::move(conn_data_);
+  ENVOY_LOG(debug, "meta protocol upstream request: release upstream connection");
+  if (close && conn_data != nullptr) {
     // we shouldn't close the upstream connection unless explicitly asked at some exceptional cases
-    if (close) {
-      conn_data_->connection().close(Network::ConnectionCloseType::NoFlush);
-      ENVOY_LOG(warn, "meta protocol upstream request: close upstream connection");
-    }
-
-    // upstream connection is released back to the pool for re-use when it's containing
-    // ConnectionData is destroyed
-    conn_data_.reset();
-    ENVOY_LOG(debug, "meta protocol upstream request: release upstream connection");
+    conn_data->connection().close(Network::ConnectionCloseType::NoFlush);
+    ENVOY_LOG(warn, "meta protocol upstream request: close upstream connection");
   }
 }
 
@@ -84,13 +84,14 @@ void UpstreamRequest::encodeData(Buffer::Instance& data) {
   ASSERT(!conn_pool_handle_);
 
   ENVOY_LOG(trace, "proxying {} bytes", data.length());
-  Codec& codec = parent_.codec();
-  codec.encode(*metadata_, *mutation_, data);
+  auto codec = parent_.createCodec();
+  codec->encode(*metadata_, *mutation_, data);
   conn_data_->connection().write(data, false);
 }
 
 void UpstreamRequest::onPoolFailure(ConnectionPool::PoolFailureReason reason, absl::string_view,
                                     Upstream::HostDescriptionConstSharedPtr host) {
+  parent_.onUpstreamHostSelected(host);
   conn_pool_handle_ = nullptr;
 
   // Mimic an upstream reset.
@@ -118,6 +119,7 @@ void UpstreamRequest::onPoolFailure(ConnectionPool::PoolFailureReason reason, ab
 void UpstreamRequest::onPoolReady(Tcp::ConnectionPool::ConnectionDataPtr&& conn_data,
                                   Upstream::HostDescriptionConstSharedPtr host) {
   ENVOY_LOG(debug, "meta protocol upstream request: tcp connection is ready");
+  parent_.onUpstreamHostSelected(host);
 
   // Only invoke continueDecoding if we'd previously stopped the filter chain.
   bool continue_decoding = conn_pool_handle_ != nullptr;
@@ -133,7 +135,7 @@ void UpstreamRequest::onPoolReady(Tcp::ConnectionPool::ConnectionDataPtr&& conn_
 
   // Store the upstream ip to the metadata, which will be used in the response
   metadata_->putString(
-      Metadata::HEADER_REAL_SERVER_ADDRESS,
+      ReservedHeaders::RealServerAddress,
       conn_data_->connection().connectionInfoProvider().remoteAddress()->asString());
 
   onRequestStart(continue_decoding);
@@ -215,7 +217,7 @@ void UpstreamRequest::onUpstreamConnectionReset(ConnectionPool::PoolFailureReaso
         false);
     break;
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not reached");
   }
   if (!response_complete_) {
     parent_.resetStream();

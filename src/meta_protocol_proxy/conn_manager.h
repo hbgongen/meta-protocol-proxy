@@ -1,12 +1,14 @@
 #pragma once
 
 #include "envoy/common/time.h"
-#include "api/meta_protocol_proxy/v1alpha/meta_protocol_proxy.pb.h"
+#include "envoy/event/timer.h"
 #include "envoy/network/connection.h"
 #include "envoy/network/filter.h"
 #include "envoy/stats/timespan.h"
 
 #include "source/common/common/logger.h"
+
+#include "api/meta_protocol_proxy/v1alpha/meta_protocol_proxy.pb.h"
 
 #include "src/meta_protocol_proxy/codec/codec.h"
 #include "src/meta_protocol_proxy/active_message.h"
@@ -16,7 +18,8 @@
 #include "src/meta_protocol_proxy/stats.h"
 #include "src/meta_protocol_proxy/route/rds.h"
 #include "src/meta_protocol_proxy/stream.h"
-#include "envoy/event/timer.h"
+#include "src/meta_protocol_proxy/tracing/tracer.h"
+#include "src/meta_protocol_proxy/request_id/config.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -32,7 +35,7 @@ public:
 
   virtual FilterChainFactory& filterFactory() PURE;
   virtual MetaProtocolProxyStats& stats() PURE;
-  virtual Codec& createCodec() PURE;
+  virtual CodecPtr createCodec() PURE;
   virtual Route::Config& routerConfig() PURE;
   virtual std::string applicationProtocol() PURE;
   virtual absl::optional<std::chrono::milliseconds> idleTimeout() PURE;
@@ -42,6 +45,10 @@ public:
    *         this function.
    */
   virtual Route::RouteConfigProvider* routeConfigProvider() PURE;
+  virtual Tracing::MetaProtocolTracerSharedPtr tracer() PURE;
+  virtual Tracing::TracingConfig* tracingConfig() PURE;
+  virtual RequestIDExtensionSharedPtr requestIDExtension() PURE;
+  virtual const std::vector<AccessLog::InstanceSharedPtr>& accessLogs() const PURE;
 };
 
 // class ActiveMessagePtr;
@@ -68,7 +75,7 @@ public:
 
   // RequestDecoderCallbacks
   MessageHandler& newMessageHandler() override;
-  void onHeartbeat(MetadataSharedPtr metadata) override;
+  bool onHeartbeat(MetadataSharedPtr metadata) override;
 
   MetaProtocolProxyStats& stats() const { return stats_; }
   Network::Connection& connection() const { return read_callbacks_->connection(); }
@@ -85,19 +92,23 @@ public:
   void closeStream(uint64_t stream_id);
   void clearStream() { active_stream_map_.clear(); }
 
+  Tracing::MetaProtocolTracerSharedPtr tracer() { return config_.tracer(); };
+  Tracing::TracingConfig* tracingConfig() { return config_.tracingConfig(); };
+  RequestIDExtensionSharedPtr requestIDExtension() { return config_.requestIDExtension(); };
+  const std::vector<AccessLog::InstanceSharedPtr>& accessLogs() { return config_.accessLogs(); };
+
   // This function is for testing only.
   std::list<ActiveMessagePtr>& getActiveMessagesForTest() { return active_message_list_; }
-
 
 private:
   void dispatch();
   void resetAllMessages(bool local_reset);
 
-  //This function is to deal with idle downstream's connection timeout. 
+  // This function is to deal with idle downstream's connection timeout.
   void onIdleTimeout();
-  //Reset the timer.
+  // Reset the timer.
   void resetIdleTimer();
-  //Disable the timer
+  // Disable the timer
   void disableIdleTimer();
 
   Buffer::OwnedImpl request_buffer_;
@@ -109,10 +120,10 @@ private:
   MetaProtocolProxyStats& stats_;
   Random::RandomGenerator& random_generator_;
 
-  Codec& codec_;
+  CodecPtr codec_;
   RequestDecoderPtr decoder_;
   Network::ReadFilterCallbacks* read_callbacks_{};
-  //timer for idle timeout
+  // timer for idle timeout
   Event::TimerPtr idle_timer_;
 };
 

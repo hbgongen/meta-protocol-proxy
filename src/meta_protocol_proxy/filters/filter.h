@@ -10,7 +10,9 @@
 #include "src/meta_protocol_proxy/codec/codec.h"
 
 #include "src/meta_protocol_proxy/decoder_event_handler.h"
+#include "src/meta_protocol_proxy/request_id/config.h"
 #include "src/meta_protocol_proxy/route/route.h"
+#include "src/meta_protocol_proxy/tracing/tracer.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -52,6 +54,20 @@ public:
 };
 
 using DirectResponsePtr = std::unique_ptr<DirectResponse>;
+
+/**
+ * CodecFactory creates codec.
+ */
+class CodecFactory {
+public:
+  virtual ~CodecFactory() = default;
+  
+  /**
+   * Create a codec, which will be used by the router to encode request and response
+   * @return CodecPtr
+   */
+  virtual CodecPtr createCodec() PURE;
+};
 
 /**
  * Decoder filter callbacks add additional callbacks.
@@ -99,7 +115,7 @@ public:
 /**
  * Decoder filter callbacks add additional callbacks.
  */
-class DecoderFilterCallbacks : public virtual FilterCallbacksBase {
+class DecoderFilterCallbacks : public virtual FilterCallbacksBase, public virtual CodecFactory {
 public:
   ~DecoderFilterCallbacks() override = default;
 
@@ -138,17 +154,35 @@ public:
   virtual void resetDownstreamConnection() PURE;
 
   /**
-   * Get the codec, which will be used by the router to encode request and response
-   * @return CodecPtr
-   */
-  virtual Codec& codec() PURE;
-
-  /**
    * Set the selected upstream connection, used by router.
    * This method is used to initialize the upstream connection for a streaming RPC
-   * @param conn supplies the upstream's connection
+   * @param conn supplies the upstream connection
    */
   virtual void setUpstreamConnection(Tcp::ConnectionPool::ConnectionDataPtr conn) PURE;
+
+  /**
+   * Get the tracer, used by router to create tracing spans
+   * @return
+   */
+  virtual Tracing::MetaProtocolTracerSharedPtr tracer() PURE;
+
+  /**
+   * Get the Tracing Config of this MetaProtocol Proxy
+   * @return null pointer if tracing is not enabled
+   */
+  virtual Tracing::TracingConfig* tracingConfig() PURE;
+
+  /**
+   *  Get the Request ID Extension, which is used by the router to generate x-request-id
+   * @return
+   */
+  virtual RequestIDExtensionSharedPtr requestIDExtension() PURE;
+
+  /**
+   * Get the Access Loggers of this MetaProtocol Proxy
+   * @return
+   */
+  virtual const std::vector<AccessLog::InstanceSharedPtr>& accessLogs() PURE;
 };
 
 /**

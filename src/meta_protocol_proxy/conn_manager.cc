@@ -20,11 +20,10 @@ ConnectionManager::ConnectionManager(Config& config, Random::RandomGenerator& ra
                                      TimeSource& time_system)
     : config_(config), time_system_(time_system), stats_(config_.stats()),
       random_generator_(random_generator), codec_(config.createCodec()),
-      decoder_(std::make_unique<RequestDecoder>(codec_, *this)) {}
+      decoder_(std::make_unique<RequestDecoder>(*codec_, *this)) {}
 
 Network::FilterStatus ConnectionManager::onData(Buffer::Instance& data, bool end_stream) {
   ENVOY_LOG(debug, "meta protocol: read {} bytes", data.length());
-
   request_buffer_.move(data);
   dispatch();
 
@@ -41,11 +40,11 @@ Network::FilterStatus ConnectionManager::onData(Buffer::Instance& data, bool end
 }
 
 Network::FilterStatus ConnectionManager::onNewConnection() {
-  //init idle timer.
-  if(config_.idleTimeout()){
-    idle_timer_ = read_callbacks_->connection().dispatcher().createTimer(
-        [this]() { this->onIdleTimeout(); });  
-    resetIdleTimer();           
+  // init idle timer.
+  if (config_.idleTimeout()) {
+    idle_timer_ =
+        read_callbacks_->connection().dispatcher().createTimer([this]() { this->onIdleTimeout(); });
+    resetIdleTimer();
   }
   return Network::FilterStatus::Continue;
 }
@@ -59,11 +58,9 @@ void ConnectionManager::initializeReadFilterCallbacks(Network::ReadFilterCallbac
 
 void ConnectionManager::onEvent(Network::ConnectionEvent event) {
   if (event == Network::ConnectionEvent::LocalClose) {
-    ENVOY_LOG(debug, "meta protocol: LocalClose");
     disableIdleTimer();
     resetAllMessages(true);
   } else if (event == Network::ConnectionEvent::RemoteClose) {
-    ENVOY_LOG(debug, "meta protocol: RemoteClose");
     disableIdleTimer();
     resetAllMessages(false);
   }
@@ -88,19 +85,19 @@ MessageHandler& ConnectionManager::newMessageHandler() {
   return **active_message_list_.begin();
 }
 
-void ConnectionManager::onHeartbeat(MetadataSharedPtr metadata) {
+bool ConnectionManager::onHeartbeat(MetadataSharedPtr metadata) {
   stats_.request_event_.inc();
-
   if (read_callbacks_->connection().state() != Network::Connection::State::Open) {
     ENVOY_LOG(warn, "meta protocol: downstream connection is closed or closing");
-    return;
+    return false;
   }
 
   HeartbeatResponse heartbeat;
   Buffer::OwnedImpl response_buffer;
 
-  heartbeat.encode(*metadata, codec_, response_buffer);
+  heartbeat.encode(*metadata, *codec_, response_buffer);
   read_callbacks_->connection().write(response_buffer, false);
+  return false;
 }
 
 void ConnectionManager::dispatch() {
@@ -108,14 +105,15 @@ void ConnectionManager::dispatch() {
     ENVOY_LOG(debug, "meta protocol: it's empty data");
     return;
   }
-  //when data is not empty,it will enable timer again.
+  // when data is not empty,it will enable timer again.
   resetIdleTimer();
   try {
     bool underflow = false;
     // decoder return underflow in th following two cases:
-    // 1. decoder needs more data to complete the decoding of the current message, in this case, the buffer contains
-    // part of the incomplete message.
-    // 2. all the messages in the buffer have been processed, in this case, the buffer is already empty.
+    // 1. decoder needs more data to complete the decoding of the current message, in this case, the
+    // buffer contains part of the incomplete message.
+    // 2. all the messages in the buffer have been processed, in this case, the buffer is already
+    // empty.
     while (!underflow) {
       decoder_->onData(request_buffer_, underflow);
     }
@@ -138,7 +136,7 @@ void ConnectionManager::sendLocalReply(Metadata& metadata, const DirectResponse&
 
   try {
     Buffer::OwnedImpl buffer;
-    result = response.encode(metadata, codec_, buffer);
+    result = response.encode(metadata, *codec_, buffer);
 
     read_callbacks_->connection().write(buffer, end_stream);
   } catch (const EnvoyException& ex) {
@@ -160,13 +158,13 @@ void ConnectionManager::sendLocalReply(Metadata& metadata, const DirectResponse&
     stats_.local_response_business_exception_.inc();
     break;
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("invalid response type");
   }
 }
 
 Stream& ConnectionManager::newActiveStream(uint64_t stream_id) {
   ENVOY_CONN_LOG(debug, "meta protocol: create an active stream: {}", connection(), stream_id);
-  StreamPtr new_stream(std::make_unique<Stream>(stream_id, connection(), *this, codec_));
+  StreamPtr new_stream(std::make_unique<Stream>(stream_id, connection(), *this, *codec_));
   active_stream_map_[stream_id] = std::move(new_stream);
   return *active_stream_map_.find(stream_id)->second;
 }
@@ -232,7 +230,6 @@ void ConnectionManager::disableIdleTimer() {
     idle_timer_.reset();
   }
 }
-
 
 } // namespace  MetaProtocolProxy
 } // namespace NetworkFilters

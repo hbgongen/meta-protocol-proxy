@@ -18,7 +18,6 @@
 
 #include "absl/types/optional.h"
 
-
 namespace Envoy {
 namespace Extensions {
 namespace NetworkFilters {
@@ -33,7 +32,7 @@ class ActiveResponseDecoder : public ResponseDecoderCallbacks,
 public:
   ActiveResponseDecoder(ActiveMessage& parent, MetaProtocolProxyStats& stats,
                         Network::Connection& connection, std::string applicationProtocol,
-                        Codec& codec, Metadata& requestMetadata);
+                        CodecPtr&& codec, Metadata& requestMetadata);
   ~ActiveResponseDecoder() override = default;
 
   UpstreamResponseStatus onData(Buffer::Instance& data);
@@ -43,7 +42,7 @@ public:
 
   // ResponseDecoderCallbacks
   MessageHandler& newMessageHandler() override { return *this; }
-  void onHeartbeat(MetadataSharedPtr) override { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  bool onHeartbeat(MetadataSharedPtr) override { return true; } // ignore the heartbeat in response
 
   uint64_t requestId() const { return metadata_ ? metadata_->getRequestId() : 0; }
 
@@ -54,7 +53,7 @@ private:
   MetaProtocolProxyStats& stats_;
   Network::Connection& downstream_connection_;
   std::string application_protocol_;
-  Codec& codec_;
+  CodecPtr codec_;
   Metadata& request_metadata_;
   ResponseDecoderPtr decoder_;
   MetadataSharedPtr metadata_;
@@ -104,8 +103,12 @@ public:
   void startUpstreamResponse(Metadata& requestMetadata) override;
   UpstreamResponseStatus upstreamData(Buffer::Instance& buffer) override;
   void resetDownstreamConnection() override;
-  Codec& codec() override;
+  CodecPtr createCodec() override;
   void setUpstreamConnection(Tcp::ConnectionPool::ConnectionDataPtr conn) override;
+  Tracing::MetaProtocolTracerSharedPtr tracer() override;
+  Tracing::TracingConfig* tracingConfig() override;
+  RequestIDExtensionSharedPtr requestIDExtension() override;
+  const std::vector<AccessLog::InstanceSharedPtr>& accessLogs() override;
 
   DecoderFilterSharedPtr handler() { return handle_; }
 
@@ -179,10 +182,14 @@ public:
   void startUpstreamResponse(Metadata& requestMetadata) override;
   UpstreamResponseStatus upstreamData(Buffer::Instance& buffer) override;
   void resetDownstreamConnection() override;
-  Codec& codec() override;
+  CodecPtr createCodec() override;
   Event::Dispatcher& dispatcher() override;
   void resetStream() override;
   void setUpstreamConnection(Tcp::ConnectionPool::ConnectionDataPtr conn) override;
+  Tracing::MetaProtocolTracerSharedPtr tracer() override;
+  Tracing::TracingConfig* tracingConfig() override;
+  RequestIDExtensionSharedPtr requestIDExtension() override;
+  const std::vector<AccessLog::InstanceSharedPtr>& accessLogs() override;
 
   void createFilterChain();
   FilterStatus applyDecoderFilters(ActiveMessageDecoderFilter* filter,
@@ -217,8 +224,7 @@ private:
 
   // This value is used in the calculation of the weighted cluster.
   uint64_t stream_id_;
-  StreamInfo::StreamInfoImpl stream_info_;
-
+  std::shared_ptr<StreamInfo::StreamInfo> stream_info_;
   Buffer::OwnedImpl response_buffer_;
 
   bool pending_stream_decoded_ : 1;
@@ -228,7 +234,6 @@ private:
 };
 
 using ActiveMessagePtr = std::unique_ptr<ActiveMessage>;
-
 
 } // namespace MetaProtocolProxy
 } // namespace NetworkFilters

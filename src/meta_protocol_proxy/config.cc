@@ -2,7 +2,10 @@
 
 #include "absl/container/flat_hash_map.h"
 
+#include "envoy/config/accesslog/v3/accesslog.pb.h"
 #include "envoy/registry/registry.h"
+
+#include "source/common/access_log/access_log_impl.h"
 #include "source/common/config/utility.h"
 
 #include "src/meta_protocol_proxy/codec/factory.h"
@@ -11,6 +14,8 @@
 #include "src/meta_protocol_proxy/stats.h"
 #include "src/meta_protocol_proxy/route/route_config_provider_manager.h"
 #include "src/meta_protocol_proxy/route/rds_impl.h"
+#include "src/meta_protocol_proxy/tracing/tracer_manager_impl.h"
+#include "src/meta_protocol_proxy/tracing/tracer_config_impl.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -19,6 +24,7 @@ namespace MetaProtocolProxy {
 
 // Singleton registration via macro defined in envoy/singleton/manager.h
 SINGLETON_MANAGER_REGISTRATION(meta_route_config_provider_manager);
+SINGLETON_MANAGER_REGISTRATION(meta_tracer_manager);
 
 Utility::Singletons Utility::createSingletons(Server::Configuration::FactoryContext& context) {
   Route::RouteConfigProviderManagerSharedPtr meta_route_config_provider_manager =
@@ -26,7 +32,15 @@ Utility::Singletons Utility::createSingletons(Server::Configuration::FactoryCont
           SINGLETON_MANAGER_REGISTERED_NAME(meta_route_config_provider_manager), [&context] {
             return std::make_shared<Route::RouteConfigProviderManagerImpl>(context.admin());
           });
-  return {meta_route_config_provider_manager};
+  auto tracer_manager =
+      context.singletonManager()
+          .getTyped<MetaProtocolProxy::Tracing::MetaProtocolTracerManagerImpl>(
+              SINGLETON_MANAGER_REGISTERED_NAME(meta_tracer_manager), [&context] {
+                return std::make_shared<MetaProtocolProxy::Tracing::MetaProtocolTracerManagerImpl>(
+                    std::make_unique<MetaProtocolProxy::Tracing::TracerFactoryContextImpl>(
+                        context.getServerFactoryContext(), context.messageValidationVisitor()));
+              });
+  return {meta_route_config_provider_manager, tracer_manager};
 }
 
 Network::FilterFactoryCb MetaProtocolProxyFilterConfigFactory::createFilterFactoryFromProtoTyped(
@@ -34,7 +48,8 @@ Network::FilterFactoryCb MetaProtocolProxyFilterConfigFactory::createFilterFacto
     Server::Configuration::FactoryContext& context) {
   Utility::Singletons singletons = Utility::createSingletons(context);
   std::shared_ptr<Config> filter_config(std::make_shared<ConfigImpl>(
-      proto_config, context, *singletons.route_config_provider_manager_));
+      proto_config, context, *singletons.route_config_provider_manager_,
+      *singletons.tracer_manager_));
 
   // This lambda captures the singletons created above, thus preserving the reference count.
   // Keep in mind the lambda capture list **doesn't** determine the destruction order, but it's fine
@@ -55,7 +70,8 @@ REGISTER_FACTORY(MetaProtocolProxyFilterConfigFactory,
 // class ConfigImpl.
 ConfigImpl::ConfigImpl(const MetaProtocolProxyConfig& config,
                        Server::Configuration::FactoryContext& context,
-                       Route::RouteConfigProviderManager& route_config_provider_manager)
+                       Route::RouteConfigProviderManager& route_config_provider_manager,
+                       MetaProtocolProxy::Tracing::MetaProtocolTracerManager& tracer_manager)
     : context_(context),
       stats_prefix_(
           fmt::format("meta_protocol.{}.{}.", config.application_protocol(), config.stat_prefix())),
@@ -63,10 +79,16 @@ ConfigImpl::ConfigImpl(const MetaProtocolProxyConfig& config,
       application_protocol_(config.application_protocol()), codecConfig_(config.codec()),
       route_config_provider_manager_(route_config_provider_manager) {
   ENVOY_LOG(trace, "********** MetaProtocolProxy ConfigImpl constructor ***********");
-  //check idle_timer config
+  int markets_size = config.codec().markets_size();
+  if (markets_size > 0){
+    for (int i = 0;i< markets_size;i++){
+      markets_table[config.codec().markets(i).name()] = config.codec().markets(i).value();
+    }
+  }
+  // check idle_timer config
   if (config.has_idle_timeout()) {
     const uint64_t timeout = DurationUtil::durationToMilliseconds(config.idle_timeout());
-    ENVOY_LOG(debug,"debug for idle_timeout-{}",timeout);
+    ENVOY_LOG(debug, "debug for idle_timeout-{}", timeout);
     idle_timeout_ = std::chrono::milliseconds(timeout);
   }
 
@@ -81,7 +103,7 @@ ConfigImpl::ConfigImpl(const MetaProtocolProxyConfig& config,
         context_.messageValidationVisitor());
     break;
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("invalid route specifier");
   }
 
   // route_matcher_ = std::make_unique<Router::RouteMatcherImpl>(config.route_config(), context);
@@ -96,6 +118,78 @@ ConfigImpl::ConfigImpl(const MetaProtocolProxyConfig& config,
       registerFilter(filter_config);
     }
   }
+
+  if (config.has_tracing()) {
+    tracer_ = tracer_manager.getOrCreateMetaProtocolTracer(getPerFilterTracerConfig(config));
+
+    const auto& tracing_config = config.tracing();
+
+    Envoy::Tracing::OperationName tracing_operation_name;
+
+    // Listener level traffic direction overrides the operation name
+    switch (context.direction()) {
+    case envoy::config::core::v3::UNSPECIFIED: {
+      // Continuing legacy behavior; if unspecified, we treat this as ingress.
+      tracing_operation_name = Envoy::Tracing::OperationName::Ingress;
+      break;
+    }
+    case envoy::config::core::v3::INBOUND:
+      tracing_operation_name = Envoy::Tracing::OperationName::Ingress;
+      break;
+    case envoy::config::core::v3::OUTBOUND:
+      tracing_operation_name = Envoy::Tracing::OperationName::Egress;
+      break;
+    default:
+      PANIC("invalid direction");
+    }
+
+    envoy::type::v3::FractionalPercent client_sampling;
+    client_sampling.set_numerator(
+        tracing_config.has_client_sampling() ? tracing_config.client_sampling().value() : 100);
+    envoy::type::v3::FractionalPercent random_sampling;
+    // TODO: Random sampling historically was an integer and default to out of 10,000. We should
+    // deprecate that and move to a straight fractional percent config.
+    uint64_t random_sampling_numerator{PROTOBUF_PERCENT_TO_ROUNDED_INTEGER_OR_DEFAULT(
+        tracing_config, random_sampling, 10000, 10000)};
+    random_sampling.set_numerator(random_sampling_numerator);
+    random_sampling.set_denominator(envoy::type::v3::FractionalPercent::TEN_THOUSAND);
+    envoy::type::v3::FractionalPercent overall_sampling;
+    uint64_t overall_sampling_numerator{PROTOBUF_PERCENT_TO_ROUNDED_INTEGER_OR_DEFAULT(
+        tracing_config, overall_sampling, 10000, 10000)};
+    overall_sampling.set_numerator(overall_sampling_numerator);
+    overall_sampling.set_denominator(envoy::type::v3::FractionalPercent::TEN_THOUSAND);
+
+    const uint32_t max_tag_length = PROTOBUF_GET_WRAPPED_OR_DEFAULT(
+        tracing_config, max_tag_length, Envoy::Tracing::DefaultMaxPathTagLength);
+
+    tracing_config_ = std::make_unique<Tracing::TracingConfigImpl>(
+        tracing_operation_name, client_sampling, random_sampling, overall_sampling,
+        tracing_config.verbose(), max_tag_length);
+  }
+  request_id_extension_ = std::make_shared<UUIDRequestIDExtension>(context.api().randomGenerator());
+
+  for (const envoy::config::accesslog::v3::AccessLog& log_config : config.access_log()) {
+    access_logs_.emplace_back(AccessLog::AccessLogFactory::fromProto(log_config, context));
+  }
+}
+
+/**
+ * Determines what tracing provider to use for a given
+ * "envoy.filters.network.http_connection_manager" filter instance.
+ */
+const envoy::config::trace::v3::Tracing_Http*
+ConfigImpl::getPerFilterTracerConfig(const MetaProtocolProxyConfig& config) {
+  // Give precedence to tracing provider configuration defined as part of
+  // "envoy.filters.network.http_connection_manager" filter config.
+  if (config.tracing().has_provider()) {
+    return &config.tracing().provider();
+  }
+  // Otherwise, for the sake of backwards compatibility, fall back to using tracing provider
+  // configuration defined in the bootstrap config.
+  if (context_.httpContext().defaultTracingConfig().has_http()) {
+    return &context_.httpContext().defaultTracingConfig().http();
+  }
+  return nullptr;
 }
 
 void ConfigImpl::createFilterChain(FilterChainFactoryCallbacks& callbacks) {
@@ -115,22 +209,13 @@ Route::RouteConstSharedPtr ConfigImpl::route(const Metadata& metadata,
   // return route_matcher_->route(metadata, random_value);
 }
 
-Codec& ConfigImpl::createCodec() {
+CodecPtr ConfigImpl::createCodec() {
   auto& factory = Envoy::Config::Utility::getAndCheckFactoryByName<NamedCodecConfigFactory>(
       codecConfig_.name());
   ProtobufTypes::MessagePtr message = factory.createEmptyConfigProto();
   Envoy::Config::Utility::translateOpaqueConfig(codecConfig_.config(),
                                                 context_.messageValidationVisitor(), *message);
-  auto key = message->SerializeAsString();
-  auto result = codec_map_.find(key);
-  if (result != codec_map_.end()) {
-    return *result->second;
-  }
-  ENVOY_LOG(trace, "meta protocol: create codec {}", codecConfig_.name());
-  codec_map_.insert({key, factory.createCodec(*message)});
-  // We use reference at all other places because the life span of unique_ptr codec in this map is
-  // always longer than everywhere else
-  return *codec_map_.find(key)->second;
+  return factory.createCodec(*message);
 }
 
 void ConfigImpl::registerFilter(const MetaProtocolFilterConfig& proto_config) {

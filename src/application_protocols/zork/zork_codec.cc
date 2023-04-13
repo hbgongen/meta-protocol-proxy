@@ -15,7 +15,7 @@ namespace Zork {
 
 MetaProtocolProxy::DecodeStatus ZorkCodec::decode(Buffer::Instance& buffer,
                                                   MetaProtocolProxy::Metadata& metadata) {
-  ENVOY_LOG(debug, "Zork decode: {} bytes available, msg type: {}", buffer.length(), metadata.getMessageType());
+  //ENVOY_LOG(debug, "Zork decode: {} bytes available, msg type: {}", buffer.length(), metadata.getMessageType());
   messageType_ = metadata.getMessageType();
   ASSERT(messageType_ == MetaProtocolProxy::MessageType::Request ||
          messageType_ == MetaProtocolProxy::MessageType::Response);
@@ -27,26 +27,30 @@ MetaProtocolProxy::DecodeStatus ZorkCodec::decode(Buffer::Instance& buffer,
             ZorkDecodeStatus nextState_request = handleRequestState(buffer);
         if (nextState_request == ZorkDecodeStatus::WaitForData) {
           ENVOY_LOG(debug, "ZorkCodec handleState is wait for data.");
+          metadata.putString("decodestatus","Request WaitForData");
           return DecodeStatus::WaitForData;
         }
         decode_status_request = nextState_request;
       }
+        metadata.putString("decodestatus","Request Done");
         toMetadata(metadata);
         decode_status_request = ZorkDecodeStatus::DecodeHeader;
       }else if(messageType_ == MetaProtocolProxy::MessageType::Response){
-         while (decode_status_response != ZorkDecodeStatus::DecodeDone) {
+         while (decode_status_response != ZorkDecodeStatus::DecodeResponseDone) {
             ZorkDecodeStatus nextState_response = handleResponseState(buffer);
-        if (nextState_response == ZorkDecodeStatus::WaitForData) {
+        if (nextState_response == ZorkDecodeStatus::ResponseWaitForData) {
           ENVOY_LOG(debug, "ZorkCodec handleState is wait for data.");
+          metadata.putString("decodestatus","Response WaitForData");
           return DecodeStatus::WaitForData;
         }
         decode_status_response = nextState_response;
       }
+        metadata.putString("decodestatus","Response Done");
         toRespMetadata(metadata);
-        decode_status_response = ZorkDecodeStatus::DecodeHeader;
+        decode_status_response = ZorkDecodeStatus::DecodeResponseHeader;
       }else{
             //todo.
-            ENVOY_LOG(debug, "It's a {} type.",messageType_);
+            //ENVOY_LOG(debug, "It's a {} type.",messageType_);
       }
 
       
@@ -91,7 +95,7 @@ ZorkDecodeStatus ZorkCodec::handleRequestState(Buffer::Instance& buffer) {
   case ZorkDecodeStatus::DecodePayload:
     return decodeRequestBody(buffer);
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not reached");
   }
   return ZorkDecodeStatus::DecodeDone;
 }
@@ -99,97 +103,193 @@ ZorkDecodeStatus ZorkCodec::handleRequestState(Buffer::Instance& buffer) {
 ZorkDecodeStatus ZorkCodec::handleResponseState(Buffer::Instance& buffer) {
   switch (decode_status_response)
   {
-  case ZorkDecodeStatus::DecodeHeader:
+  case ZorkDecodeStatus::DecodeResponseHeader:
     return decodeResponseHeader(buffer);
-  case ZorkDecodeStatus::DecodePayload:
+  case ZorkDecodeStatus::DecodeResponsePayload:
     return decodeResponseBody(buffer);
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not reached");
   }
-  return ZorkDecodeStatus::DecodeDone;
+  return ZorkDecodeStatus::DecodeResponseDone;
 }
 
 ZorkDecodeStatus ZorkCodec::decodeRequestHeader(Buffer::Instance& buffer) {
-  ENVOY_LOG(debug, "decode zork request header: {}", buffer.length());
+  //ENVOY_LOG(debug, "decode zork request header: {}", buffer.length());
   // Wait for more data if the header is not complete
-  if (buffer.length() < ZorkHeader::HEADER_SIZE) {
+  if (!zork_header_request_.decodeRequest(buffer)) {
       ENVOY_LOG(debug, "request header continue {}", buffer.length());
+      //buffer.drain(buffer.length());
     return ZorkDecodeStatus::WaitForData;
   }
 
-  if(!zork_header_request_.decode(buffer)) {
-    throw EnvoyException(fmt::format("zork request header invalid"));
-  }
+  // if(!zork_header_request_.decodeRequest(buffer)) {
+  //   buffer.drain(buffer.length());
+  //   //throw EnvoyException(fmt::format("zork request header invalid"));
+  //   return ZorkDecodeStatus::WaitForData;
+  // }
 
   
 
-  ENVOY_LOG(debug, "decode request header over,buffer length is {}", buffer.length());
+  //ENVOY_LOG(debug, "decode request header over,buffer length is {}", buffer.length());
   return ZorkDecodeStatus::DecodePayload;
 
 }
 
 ZorkDecodeStatus ZorkCodec::decodeResponseHeader(Buffer::Instance& buffer) {
-  ENVOY_LOG(debug, "decode zork response header: {}", buffer.length());
+  //ENVOY_LOG(debug, "decode zork response header: {}", buffer.length());
   // Wait for more data if the header is not complete
-  if (buffer.length() < ZorkHeader::HEADER_SIZE) {
-      ENVOY_LOG(debug, "response header continue {}", buffer.length());
-    return ZorkDecodeStatus::WaitForData;
-  }
+  // if (buffer.length() < ZorkHeader::HEADER_SIZE) {
+  //     ENVOY_LOG(debug, "response header continue {}", buffer.length());
+  //   return ZorkDecodeStatus::ResponseWaitForData;
+  // }
 
-  if(!zork_header_response_.decode(buffer)) {
-    throw EnvoyException(fmt::format("zork header invalid"));
+  if(!zork_header_response_.decodeResponse(buffer)) {
+    ENVOY_LOG(debug, "response header continue {}", buffer.length());
+    return ZorkDecodeStatus::ResponseWaitForData;
   }
 
   
 
-  ENVOY_LOG(debug, "decode response header over,buffer length is {}", buffer.length());
-  return ZorkDecodeStatus::DecodePayload;
+  //ENVOY_LOG(debug, "decode response header over,buffer length is {}", buffer.length());
+  return ZorkDecodeStatus::DecodeResponsePayload;
 
 }
 
 ZorkDecodeStatus ZorkCodec::decodeRequestBody(Buffer::Instance& buffer) {
   // Wait for more data if the buffer is not a complete message	
- 
-  if (buffer.length() < ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len() + 1) {
-    ENVOY_LOG(debug, "decodeRequestBody-{}< header_size-{} packet_len-{}", buffer.length(),ZorkHeader::HEADER_SIZE,zork_header_request_.get_pack_len()+1);
-    return ZorkDecodeStatus::WaitForData;
+  
+  // if (zork_header_request_.get_tag() == '{'){  //123-{
+	//       if (buffer.length() < ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len()+1) {
+	// 		  ENVOY_LOG(debug, "decodeRequestBody-{}< header_size-{} packet_len-{}+1", buffer.length(),ZorkHeader::HEADER_SIZE,zork_header_request_.get_pack_len()+1);
+	// 	          return ZorkDecodeStatus::WaitForData;
+	//       }
+  //       // if (zork_header_request_.get_ctag() != '}'){
+  //       //   ENVOY_LOG(debug,"decodeRequestBody first is { but last is not },data is not comleted!");
+  //       //   return ZorkDecodeStatus::WaitForData;
+  //       // }
+	//      origin_msg_request_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len()+1);
+  // }else{
+  //      if (buffer.length() < ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len()) {
+	// 		  ENVOY_LOG(debug, "decodeRequestBody-{}< header_size-{} packet_len-{}+1", buffer.length(),ZorkHeader::HEADER_SIZE,zork_header_request_.get_pack_len()+1);
+	// 	          return ZorkDecodeStatus::WaitForData;
+	//       }
+  //       // if (zork_header_request_.get_ctag() != '}'){
+  //       //   ENVOY_LOG(debug,"decodeRequestBody first is { but last is not },data is not comleted!");
+  //       //   return ZorkDecodeStatus::WaitForData;
+  //       // }
+	//      origin_msg_request_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len()+1);
+  // }
+
+  
+  
+
+  if (zork_header_request_.get_ctag() == ':' || zork_header_request_.get_ios_combine_flag() == 3){
+    //coming_buffer_len = buffer.length();
+    coming_buffer_len = zork_header_request_.get_combine_pack_len();
+    //origin_msg_request_.move(buffer);
+    origin_msg_request_.move(buffer,coming_buffer_len);
+  }else if(zork_header_request_.get_tag() == '{'){
+    coming_buffer_len = ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len()+1;
+    origin_msg_request_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len()+1);
+  }else{
+    coming_buffer_len = ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len();
+    origin_msg_request_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len());
   }
-
-  origin_msg_request_ = std::make_unique<Buffer::OwnedImpl>();
-
+  
+  //origin_msg_request_ = std::make_unique<Buffer::OwnedImpl>();
+  
   // move the decoded message out of the buffer
-  origin_msg_request_->move(buffer,zork_header_request_.get_pack_len() + ZorkHeader::HEADER_SIZE + 1);
+  //origin_msg_request_->move(buffer);
+  //origin_msg_request_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len());
   return ZorkDecodeStatus::DecodeDone;
 }
 
 ZorkDecodeStatus ZorkCodec::decodeResponseBody(Buffer::Instance& buffer) {
-  // Wait for more data if the buffer is not a complete message	
- 
-  if (buffer.length() < ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len() + 1) {
-    ENVOY_LOG(debug, "decodeResponseBody-{}< header_size-{} packet_len-{}", buffer.length(),ZorkHeader::HEADER_SIZE,zork_header_response_.get_pack_len()+1);
-    return ZorkDecodeStatus::WaitForData;
+  // Wait for more data if the buffer is not a complete message
+  // if (zork_header_response_.get_tag() == 123){  //123-{
+  // 	if (buffer.length() < ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len()+1) {
+	//   ENVOY_LOG(debug, "decodeResponseBody-{}< header_size-{} packet_len-{}+1", buffer.length(),ZorkHeader::HEADER_SIZE,zork_header_response_.get_pack_len()+1);
+  //         return ZorkDecodeStatus::ResponseWaitForData;
+	// }
+	// origin_msg_response_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len()+1);
+  // }else{ 
+  // 	if (buffer.length() < ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len()) {
+  //   		ENVOY_LOG(debug, "decodeResponseBody-{}< header_size-{} packet_len-{}", buffer.length(),ZorkHeader::HEADER_SIZE,zork_header_response_.get_pack_len());
+  //  		 return ZorkDecodeStatus::ResponseWaitForData;
+  // 	}
+	// origin_msg_response_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len());
+  // }
+  // if (zork_header_response_.get_tag() == '{'){  //123-{
+	//       if (buffer.length() < ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len()+1) {
+	// 		  ENVOY_LOG(debug, "decodeResponseBody-{}< header_size-{} packet_len-{}+1", buffer.length(),ZorkHeader::HEADER_SIZE,zork_header_response_.get_pack_len()+1);
+	// 	          return ZorkDecodeStatus::ResponseWaitForData;
+	//       }
+  //       if (zork_header_response_.get_ctag() != '}'){
+  //         ENVOY_LOG(debug,"decodeResponseBody first is { but last is not },data is not comleted!");
+  //         return ZorkDecodeStatus::ResponseWaitForData;
+  //       }
+	//      //origin_msg_request_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len()+1);
+  // }else{
+ 	//  if (buffer.length() < ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len()) {
+  //  	 ENVOY_LOG(debug, "decodeResponseBody-{}< header_size-{} packet_len-{}", buffer.length(),ZorkHeader::HEADER_SIZE,zork_header_response_.get_pack_len());
+  //  	 return ZorkDecodeStatus::ResponseWaitForData;
+  // 	}
+	//  //origin_msg_request_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_request_.get_pack_len());
+  // }
+  //冒泡排序
+  
+  //origin_msg_response_ = std::make_unique<Buffer::OwnedImpl>();
+  if (zork_header_response_.get_ctag() == ':'){
+    //coming_buffer_len = buffer.length();
+    coming_buffer_len = zork_header_response_.get_combine_pack_len();
+    //origin_msg_response_.move(buffer);
+    origin_msg_response_.move(buffer,coming_buffer_len);
+  }else if(zork_header_response_.get_tag() == '{'){
+    coming_buffer_len = ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len()+1;
+    origin_msg_response_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len()+1);
+  }else{
+    // coming_buffer_len = ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len();
+    // origin_msg_response_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len());
+
+    coming_buffer_len = buffer.length();
+    origin_msg_response_.move(buffer);
   }
 
-  origin_msg_response_ = std::make_unique<Buffer::OwnedImpl>();
-
   // move the decoded message out of the buffer
-  origin_msg_response_->move(buffer,zork_header_response_.get_pack_len() + ZorkHeader::HEADER_SIZE + 1);
-  return ZorkDecodeStatus::DecodeDone;
+  //origin_msg_response_->move(buffer);
+  //origin_msg_response_.move(buffer,ZorkHeader::HEADER_SIZE + zork_header_response_.get_pack_len());
+  return ZorkDecodeStatus::DecodeResponseDone;
 }
 
 void ZorkCodec::toMetadata(MetaProtocolProxy::Metadata& metadata) {
     metadata.putString("market", std::to_string(zork_header_request_.get_pack_attrs()));
     metadata.putString("type", std::to_string(zork_header_request_.get_req_type()));
-    metadata.setOriginMessage(*origin_msg_request_);
+  //   metadata.setHeaderSize(ZorkHeader::HEADER_SIZE);
+  // if (zork_header_request_.get_tag() == '{'){
+	// 	metadata.setBodySize(zork_header_request_.get_pack_len()+1);
+	// }else{
+	// 	metadata.setBodySize(zork_header_request_.get_pack_len());
+	// }
+  //   metadata.originMessage().move(origin_msg_request_);
+  metadata.setBodySize(coming_buffer_len);
+  metadata.originMessage().move(origin_msg_request_);
 }
 
 void ZorkCodec::toRespMetadata(MetaProtocolProxy::Metadata& metadata) {
-    metadata.setOriginMessage(*origin_msg_response_);
+  //   metadata.setHeaderSize(ZorkHeader::HEADER_SIZE);
+  //       if (zork_header_response_.get_tag() == '{'){
+  // 		metadata.setBodySize(zork_header_response_.get_pack_len()+1);
+	// }else{
+	// 	metadata.setBodySize(zork_header_response_.get_pack_len());
+	// }
+  //   metadata.originMessage().move(origin_msg_response_);
+  metadata.setBodySize(coming_buffer_len);
+  metadata.originMessage().move(origin_msg_response_);
 }
 
 
 
-} // namespace Awesomerpc
+} // namespace Zork
 } // namespace MetaProtocolProxy
 } // namespace NetworkFilters
 } // namespace Extensions

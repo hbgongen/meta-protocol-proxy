@@ -55,8 +55,8 @@ MetaProtocolProxy::DecodeStatus ThriftCodec::decode(Buffer::Instance& data,
       std::string ex_msg = metadata_->appExceptionMessage();
       // Force new metadata if we get called again.
       metadata_.reset();
-      throw EnvoyException(
-          fmt::format("thrift AppException: type: {}, message: {}", ex_type, ex_msg));
+      throw EnvoyException(fmt::format("thrift AppException: type: {}, message: {}",
+			                                             static_cast<int>(ex_type), ex_msg));
     }
 
     frame_started_ = true;
@@ -83,7 +83,7 @@ MetaProtocolProxy::DecodeStatus ThriftCodec::decode(Buffer::Instance& data,
   }
 
   toMetadata(*metadata_, metadata);
-  ENVOY_LOG(debug, "thrift: origin message length {}  ", metadata.getOriginMessage().length());
+  ENVOY_LOG(debug, "thrift: origin message length {}  ", metadata.originMessage().length());
 
   frame_ended_ = true;
   metadata_.reset();
@@ -108,7 +108,7 @@ void ThriftCodec::encode(const MetaProtocolProxy::Metadata& metadata,
     ENVOY_LOG(debug, "thrift: codec mutation {} : {}", keyValue.first, keyValue.second);
   }
   ENVOY_LOG(debug, "thrift: codec server real address: {} ",
-            metadata.getString(Metadata::HEADER_REAL_SERVER_ADDRESS));
+            metadata.getString(ReservedHeaders::RealServerAddress));
   // ASSERT(buffer.length() == 0);
   switch (metadata.getMessageType()) {
   case MetaProtocolProxy::MessageType::Heartbeat: {
@@ -127,7 +127,7 @@ void ThriftCodec::encode(const MetaProtocolProxy::Metadata& metadata,
     break;
   }
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not reachec");
   }
 }
 
@@ -198,11 +198,10 @@ void ThriftCodec::toMetadata(const ThriftProxy::MessageMetadata& msgMetadata, Me
     break;
   }
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not reachec");
   }
 
-  transport_->encodeFrame(metadata.getOriginMessage(), msgMetadata,
-                          state_machine_->originalMessage());
+  transport_->encodeFrame(metadata.originMessage(), msgMetadata, state_machine_->originalMessage());
 }
 
 void ThriftCodec::toMsgMetadata(const Metadata& metadata,
@@ -565,7 +564,7 @@ ProtocolState DecoderStateMachine::handleState(Buffer::Instance& buffer) {
   case ProtocolState::MessageEnd:
     return messageEnd(buffer);
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not reachec");
   }
 }
 

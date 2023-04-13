@@ -26,7 +26,8 @@ class NullResponseDecoder : public ResponseDecoderCallbacks,
                             public MessageHandler,
                             Logger::Loggable<Logger::Id::filter> {
 public:
-  NullResponseDecoder(Codec& codec) : decoder_(std::make_unique<ResponseDecoder>(codec, *this)) {}
+  NullResponseDecoder(CodecPtr codec)
+      : codec_(std::move(codec)), decoder_(std::make_unique<ResponseDecoder>(*codec_, *this)) {}
 
   UpstreamResponseStatus decode(Buffer::Instance& data) {
     ENVOY_LOG(debug, "meta protocol shadow router: response: the received reply data length is {}",
@@ -59,10 +60,12 @@ public:
   };
 
   // ResponseDecoderCallbacks
-  MessageHandler& newMessageHandler() override { return *this; }
-  void onHeartbeat(MetadataSharedPtr) override { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  MessageHandler& newMessageHandler() override { return *this; };
+  // Ignore the heartBeat from the upstream
+  bool onHeartbeat(MetadataSharedPtr) override { return true; };
 
 private:
+  CodecPtr codec_;
   ResponseDecoderPtr decoder_;
   bool complete_ : 1;
 };
@@ -78,7 +81,8 @@ class ShadowRouterImpl : public ShadowRouterHandle,
                          public LinkedObject<ShadowRouterImpl> {
 public:
   ShadowRouterImpl(ShadowWriterImpl& parent, const std::string& cluster_name,
-                   MetadataSharedPtr metadata, MutationSharedPtr mutation, Codec& codec);
+                   MetadataSharedPtr metadata, MutationSharedPtr mutation,
+                   CodecFactory& codec_factory);
   ~ShadowRouterImpl() override {
     ENVOY_LOG(trace, "********** ShadowRouter destructed ***********");
   };
@@ -97,13 +101,14 @@ public:
     (void)response;
     (void)end_stream;
   };
-  Codec& codec() override { return codec_; };
+  CodecPtr createCodec() override { return std::move(codec_); };
   void resetStream() override { // TODO
     if (upstream_request_ != nullptr) {
       upstream_request_->releaseUpStreamConnection(true);
     }
   }
   void setUpstreamConnection(Tcp::ConnectionPool::ConnectionDataPtr conn) override { (void)conn; };
+  void onUpstreamHostSelected(Upstream::HostDescriptionConstSharedPtr) override{};
 
   // Tcp::ConnectionPool::UpstreamCallbacks
   void onUpstreamData(Buffer::Instance& data, bool end_stream) override;
@@ -139,7 +144,7 @@ private:
   std::list<ConverterCallback> pending_callbacks_;
   bool removed_{};
 
-  Codec& codec_;
+  CodecPtr codec_;
   NullResponseDecoder decoder_;
 };
 
@@ -197,7 +202,7 @@ public:
   Upstream::ClusterManager& clusterManager() override { return cm_; }
   Event::Dispatcher& dispatcher() override { return dispatcher_; }
   void submit(const std::string& cluster_name, MetadataSharedPtr request_metadata,
-              MutationSharedPtr mutation, Codec& codec) override;
+              MutationSharedPtr mutation, CodecFactory& codec_factory) override;
 
 private:
   friend class ShadowRouterImpl;

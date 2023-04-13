@@ -41,7 +41,8 @@ namespace MetaProtocolProxy {
   COUNTER(route_us)                                                                                \
   COUNTER(route_uk)                                                                                \
   COUNTER(route_vk)                                                                                \
-  COUNTER(route_default)  
+  COUNTER(route_default)
+
 /**
  * Struct definition for all meta protocol  proxy stats. @see stats_macros.h
  */

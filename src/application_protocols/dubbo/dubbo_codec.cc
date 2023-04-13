@@ -55,7 +55,7 @@ void DubboCodec::complete() {
 void DubboCodec::encode(const MetaProtocolProxy::Metadata& metadata,
                         const MetaProtocolProxy::Mutation& mutation, Buffer::Instance& buffer) {
   ENVOY_LOG(debug, "dubbo: codec server real address: {} ",
-            metadata.getString(Metadata::HEADER_REAL_SERVER_ADDRESS));
+            metadata.getString(ReservedHeaders::RealServerAddress));
 
   switch (metadata.getMessageType()) {
   case MetaProtocolProxy::MessageType::Heartbeat: {
@@ -73,7 +73,7 @@ void DubboCodec::encode(const MetaProtocolProxy::Metadata& metadata,
     break;
   }
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not reached");
   }
 }
 
@@ -112,6 +112,7 @@ void DubboCodec::toMetadata(const MessageMetadata& msgMetadata,
 
     metadata.putString("interface", invo->serviceName());
     metadata.putString("method", invo->methodName());
+    metadata.setOperationName(invo->serviceName() + "/" + invo->methodName());
     for (const auto& pair : invo->attachment().attachment()) {
       const auto key = pair.first->toString();
       const auto value = pair.second->toString();
@@ -155,7 +156,7 @@ void DubboCodec::toMetadata(const MessageMetadata& msgMetadata,
     metadata.setMessageType(MetaProtocolProxy::MessageType::Heartbeat);
     break;
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not reached");
   }
 
   if (msgMetadata.hasResponseStatus()) {
@@ -171,7 +172,7 @@ void DubboCodec::toMetadata(const MessageMetadata& msgMetadata, Context& context
   DubboCodec::toMetadata(msgMetadata, metadata);
   metadata.setHeaderSize(context.headerSize());
   metadata.setBodySize(context.bodySize());
-  metadata.setOriginMessage(context.originMessage());
+  metadata.originMessage().move(context.originMessage());
 }
 
 void DubboCodec::toMsgMetadata(const MetaProtocolProxy::Metadata& metadata,
@@ -297,7 +298,7 @@ ProtocolState DecoderStateMachine::handleState(Buffer::Instance& buffer) {
   case ProtocolState::OnDecodeStreamData:
     return onDecodeStreamData(buffer);
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not reached");
   }
 }
 
